@@ -37,18 +37,18 @@ export function registerMessage(app) {
 
       await handleIncomingMessage(event, body);
 
-      console.log("🤖 Sending bot reply...");
+      // console.log("🤖 Sending bot reply...");
 
 
-      const truncatedText = truncateText(event.text);
+      // const truncatedText = truncateText(event.text);
 
-      await client.chat.postMessage({
-        channel: event.channel,
-        text: `Got it 👍 — "${truncatedText}" has been recorded.`,
-        thread_ts: event.thread_ts || event.ts
-      });
+      // await client.chat.postMessage({
+      //   channel: event.channel,
+      //   text: `Got it 👍 — "${truncatedText}" has been recorded.`,
+      //   thread_ts: event.thread_ts || event.ts
+      // });
 
-      console.log("✅ Bot reply sent successfully");
+      // console.log("✅ Bot reply sent successfully");
 
 
     } catch (error) {
