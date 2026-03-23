@@ -1,11 +1,7 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { config } from "../config/environment.js";
+import { GoogleGenAI } from '@google/genai';
+import { config } from '../config/environment.js';
 
-const genAI = new GoogleGenerativeAI(config.geminiApiKey);
-
-const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash"
-});
+const genAI = new GoogleGenAI({ apiKey: config.geminiApiKey });
 
 export async function classifyMessage(text) {
     console.log("🧠 classifyMessage triggered");
@@ -13,7 +9,6 @@ export async function classifyMessage(text) {
 
     if (!text || text.length < 3) {
         console.log("⚠️ Message too short — skipping AI classification");
-
         return {
             message_type: "conversation",
             importance_score: 0.1,
@@ -55,9 +50,12 @@ Return format:
     try {
         console.log("🚀 Sending request to Gemini...");
 
-        const result = await model.generateContent(prompt);
-        const response = await result.response.text();
+        const result = await genAI.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+        });
 
+        const response = result.text;
         console.log("🤖 Gemini raw response:", response);
 
         const clean = response
@@ -66,15 +64,11 @@ Return format:
             .trim();
 
         const parsed = JSON.parse(clean);
-
         console.log("✅ Parsed classification:", parsed);
-
         return parsed;
 
     } catch (error) {
-
         console.error("❌ Gemini classification failed:", error);
-
         return {
             message_type: "conversation",
             importance_score: 0.1,

@@ -1,50 +1,31 @@
 import { classifyMessage } from "../services/awareness.service.js";
-import pool from "../config/database.js";
+import { getMessageById, updateMessageEnrichment, upsertThreadDirty } from "../repositories/message.repository.js";
 
-export async function runAwarenessWorker() {
-    try {
+export async function runAwarenessWorker(jobData) {
+  const { messageId } = jobData;
 
-        const { rows: messages } = await pool.query(`
-            SELECT id, text
-            FROM messages
-            WHERE processed = false
-            ORDER BY created_at
-            LIMIT 20
-            FOR UPDATE SKIP LOCKED
-        `);
+  if (!messageId) {
+    console.warn("⚠️ No messageId in job data — skipping");
+    return;
+  }
 
-        if (!messages?.length) return;
+  console.log(`🧠 Processing message: ${messageId}`);
 
-        for (const msg of messages) {
+  const msg = await getMessageById(messageId);
 
-            const awareness = await classifyMessage(msg.text);
+  if (!msg) {
+    console.log(`⚠️ Message ${messageId} not found or already processed — skipping`);
+    return;
+  }
 
-            console.log(`🧠 Processing message: ${msg.id}`);
+  const awareness = await classifyMessage(msg.text);
 
-            await pool.query(
-                `
-                UPDATE messages
-                SET
-                    message_type = $1,
-                    importance_score = $2,
-                    entities = $3,
-                    topic_tags = $4,
-                    processed = true
-                WHERE id = $5
-                `,
-                [
-                    awareness.message_type,
-                    awareness.importance_score,
-                    awareness.entities,
-                    awareness.topic_tags,
-                    msg.id
-                ]
-            );
+  await updateMessageEnrichment(msg.id, awareness);
 
-            console.log("🧠 Processed message:", msg.id);
-        }
+  if (msg.thread_ts) {
+    await upsertThreadDirty(msg.workspace_id, msg.channel_id, msg.thread_ts);
+    console.log(`🧵 Thread upserted as dirty: ${msg.thread_ts}`);
+  }
 
-    } catch (err) {
-        console.error("Awareness worker failed:", err);
-    }
+  console.log("✅ Processed message:", msg.id);
 }

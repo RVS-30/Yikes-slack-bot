@@ -7,15 +7,17 @@
   "scripts": {
     "start": "node index.js",
     "worker:awareness": "node src/workers/startAwarenessWorker.js",
-    "dev": "concurrently \"npm run start\" \"npm run worker:awareness\""
+    "dev": "concurrently --prefix-colors \"cyan,magenta\" --names \"SERVER,WORKER\" \"npm run start\" \"npm run worker:awareness\""
   },
   "dependencies": {
+    "@google/genai": "^1.46.0",
     "@google/generative-ai": "^0.24.1",
     "@slack/bolt": "^4.1.0",
     "bullmq": "^5.71.0",
     "concurrently": "^9.2.1",
     "dotenv": "^16.4.7",
     "ioredis": "^5.10.0",
+    "node-cron": "^4.2.1",
     "pg": "^8.18.0"
   },
   "devDependencies": {

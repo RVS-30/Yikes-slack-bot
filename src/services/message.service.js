@@ -2,7 +2,8 @@ import { createMessageEntity } from "../models/message.model.js";
 import {
   updateMessageText,
   markMessageDeleted,
-  insertMessage
+  insertMessage,
+  upsertThreadDirty
 } from "../repositories/message.repository.js";
 import { awarenessQueue } from "../queues/awareness.queue.js";
 
@@ -23,7 +24,7 @@ export async function handleIncomingMessage(event, body) {
     });
 
     console.log("✅ Job added to awareness queue");
-    
+
     return savedMessage;
   } catch (error) {
     console.error("❌ Failed to handle incoming message:", error);
@@ -36,6 +37,7 @@ export async function handleMessageEdit(event, body) {
     const edited = event.message;
 
     if (!edited?.ts) return;
+    if (!edited?.edited) return;
 
     const updatedMessage = await updateMessageText({
       workspace_id: body.team_id,
@@ -46,6 +48,11 @@ export async function handleMessageEdit(event, body) {
     });
 
     console.log("✏️ Message edited:", edited.ts);
+
+    if (updatedMessage?.thread_ts) {
+      await upsertThreadDirty(body.team_id, event.channel, updatedMessage.thread_ts);
+      console.log("🧵 Thread marked dirty after edit:", updatedMessage.thread_ts);
+    }
 
     return updatedMessage;
 
@@ -65,6 +72,11 @@ export async function handleMessageDelete(event, body) {
     });
 
     console.log("🗑️ Message deleted:", event.previous_message?.ts);
+
+    if (deletedMessage?.thread_ts) {
+      await upsertThreadDirty(body.team_id, event.channel, deletedMessage.thread_ts);
+      console.log("🧵 Thread marked dirty after delete:", deletedMessage.thread_ts);
+    }
 
     return deletedMessage;
 

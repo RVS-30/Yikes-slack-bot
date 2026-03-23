@@ -1,5 +1,6 @@
 import { app, config } from "./src/app.js";
 import pool from "./src/config/database.js";
+import { startEmbeddingScheduler } from "./src/schedulers/embedding.scheduler.js";
 
 try {
   console.log("🔎 Testing database connection...");
@@ -12,6 +13,8 @@ try {
 
   await app.start(config.port);
   console.log(`⚡️ Slack app is running on port ${config.port}!`);
+
+  startEmbeddingScheduler();
 
 } catch (error) {
   console.error("❌ Failed to start application:", error);
