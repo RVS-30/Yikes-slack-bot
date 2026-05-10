@@ -3,26 +3,41 @@ import {
   updateMessageText,
   markMessageDeleted,
   insertMessage,
-  upsertThreadDirty
+  upsertThreadDirty,
+  upsertUser
 } from "../repositories/message.repository.js";
 import { awarenessQueue } from "../queues/awareness.queue.js";
 
-export async function handleIncomingMessage(event, body) {
+async function resolveAndCacheUser(client, workspaceId, userId) {
   try {
-    // 1️⃣ Normalize external Slack event → internal entity
+    const res = await client.users.info({ user: userId });
+    const profile = res.user?.profile;
+    const displayName =
+      profile?.display_name ||
+      profile?.real_name ||
+      res.user?.name ||
+      userId;
+    const avatarUrl = profile?.image_48 || null;
+    await upsertUser(workspaceId, userId, displayName, avatarUrl);
+  } catch (err) {
+    console.warn(`⚠️ Could not resolve user ${userId}:`, err.message);
+    // Non-fatal — message flow continues even if name resolution fails
+  }
+}
+
+export async function handleIncomingMessage(event, body, client) {
+  try {
     const messageEntity = createMessageEntity(event, body);
-
-    // 2️⃣ Persist into database
     const savedMessage = await insertMessage(messageEntity);
-
     console.log("💾 Message saved with ID:", savedMessage.id);
 
+    // Resolve + cache user in background — non-blocking
+    if (event.user && body.team_id) {
+      resolveAndCacheUser(client, body.team_id, event.user);
+    }
+
     console.log("📤 Pushing message to awareness queue:", savedMessage.id);
-
-    await awarenessQueue.add("classify", {
-      messageId: savedMessage.id
-    });
-
+    await awarenessQueue.add("classify", { messageId: savedMessage.id });
     console.log("✅ Job added to awareness queue");
 
     return savedMessage;
@@ -35,7 +50,6 @@ export async function handleIncomingMessage(event, body) {
 export async function handleMessageEdit(event, body) {
   try {
     const edited = event.message;
-
     if (!edited?.ts) return;
     if (!edited?.edited) return;
 
@@ -55,7 +69,6 @@ export async function handleMessageEdit(event, body) {
     }
 
     return updatedMessage;
-
   } catch (error) {
     console.error("❌ Failed to process message edit:", error);
     throw error;
@@ -64,7 +77,6 @@ export async function handleMessageEdit(event, body) {
 
 export async function handleMessageDelete(event, body) {
   try {
-
     const deletedMessage = await markMessageDeleted({
       workspace_id: body.team_id,
       channel_id: event.channel,
@@ -79,7 +91,6 @@ export async function handleMessageDelete(event, body) {
     }
 
     return deletedMessage;
-
   } catch (error) {
     console.error("❌ Failed to process message delete:", error);
     throw error;

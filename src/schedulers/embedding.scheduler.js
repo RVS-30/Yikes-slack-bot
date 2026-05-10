@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { getDirtyThreads, getThreadMessages, upsertThreadEmbedding, deleteThreadEmbedding } from '../repositories/message.repository.js';
+import { getDirtyThreads, getThreadMessages, upsertThreadEmbedding, deleteThreadEmbedding, getUsersByIds } from '../repositories/message.repository.js';
 import { buildThreadContent, generateEmbedding } from '../services/embedding.service.js';
 
 export function startEmbeddingScheduler() {
@@ -31,9 +31,14 @@ export function startEmbeddingScheduler() {
                         await deleteThreadEmbedding(thread.workspace_id, thread.channel_id, thread.thread_ts);
                         continue;
                     }
+                    
+                    // Resolve all unique users in this thread from cache
+                    const userIds = [...new Set(messages.map(m => m.user_id).filter(Boolean))];
+                    const usersMap = await getUsersByIds(thread.workspace_id, userIds);
 
-                    const content = buildThreadContent(messages);
+                    const content = buildThreadContent(messages, usersMap);
                     const embedding = await generateEmbedding(content);
+
 
                     await upsertThreadEmbedding(
                         thread.workspace_id,

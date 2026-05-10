@@ -223,3 +223,28 @@ export async function searchThreads(workspaceId, embedding, limit = 5) {
   );
   return rows;
 }
+
+export async function upsertUser(workspaceId, userId, displayName, avatarUrl) {
+  await pool.query(
+    `INSERT INTO users (workspace_id, user_id, display_name, avatar_url, fetched_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (workspace_id, user_id)
+     DO UPDATE SET
+       display_name = EXCLUDED.display_name,
+       avatar_url = EXCLUDED.avatar_url,
+       fetched_at = NOW()`,
+    [workspaceId, userId, displayName, avatarUrl]
+  );
+}
+
+// Fetch cached users by IDs — returns a map of { user_id: display_name }
+export async function getUsersByIds(workspaceId, userIds) {
+  const { rows } = await pool.query(
+    `SELECT user_id, display_name
+     FROM users
+     WHERE workspace_id = $1
+       AND user_id = ANY($2::text[])`,
+    [workspaceId, userIds]
+  );
+  return Object.fromEntries(rows.map(r => [r.user_id, r.display_name]));
+}

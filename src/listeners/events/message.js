@@ -35,7 +35,7 @@ export function registerMessage(app) {
 
       console.log("🆕 New user message:", event.text);
 
-      await handleIncomingMessage(event, body);
+      await handleIncomingMessage(event, body, client);
 
       // console.log("🤖 Sending bot reply...");
 
