@@ -3,6 +3,8 @@ import { getDecisions } from "../../repositories/message.repository.js";
 import { summarizeChannel } from "../../services/summary.service.js";
 import { logInteraction } from "../../services/context.service.js";
 import { searchMemory } from "../../services/search.service.js";
+import { saveThread, saveChannel } from "../../services/save.service.js";
+
 export function registerMemoryCommand(app) {
   app.command("/memory", async ({ command, ack, respond, client }) => {
     await ack();
@@ -31,7 +33,7 @@ export function registerMemoryCommand(app) {
           command.user_id,
           command.channel_id,
           query,
-          client
+          client,
         );
         await respond({
           replace_original: true,
@@ -75,17 +77,6 @@ export function registerMemoryCommand(app) {
           },
         ],
       });
-
-      // Non-blocking log
-      logInteraction(
-        command.team_id,
-        command.user_id,
-        command.channel_id,
-        "decisions",
-        null,
-        decisions.map((d) => d.text).join("\n"),
-        { decisionCount: decisions.length },
-      );
 
       try {
         const decisions = await getDecisions(
@@ -167,6 +158,17 @@ export function registerMemoryCommand(app) {
             },
           ],
         });
+
+        // Non-blocking log
+        logInteraction(
+          command.team_id,
+          command.user_id,
+          command.channel_id,
+          "decisions",
+          null,
+          decisions.map((d) => d.text).join("\n"),
+          { decisionCount: decisions.length },
+        );
       } catch (err) {
         console.error("❌ /memory decisions error:", err);
         await respond({
@@ -192,7 +194,7 @@ export function registerMemoryCommand(app) {
           command.team_id,
           command.user_id,
           command.channel_id,
-          client
+          client,
         );
 
         const wasTruncated = summary.length > 2900;
@@ -359,6 +361,63 @@ export function registerMemoryCommand(app) {
       await respond(
         "Available commands: `ask`, `summarize`, `search`, `save`, `decisions`",
       );
+      return;
+    }
+
+    if (subcommand === "save") {
+      const isLink = query.startsWith("http");
+
+      await respond({
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: isLink
+                ? "*Force-embedding thread...*"
+                : "*Saving last 30 minutes of this channel...*",
+            },
+          },
+        ],
+      });
+
+      try {
+        const result = isLink
+          ? await saveThread(command.team_id, command.user_id, query, client)
+          : await saveChannel(
+              command.team_id,
+              command.user_id,
+              command.channel_id,
+              client,
+            );
+
+        await respond({
+          replace_original: true,
+          blocks: [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: isLink
+                  ? `✅ Thread saved — *${result.messageCount}* message(s) embedded.`
+                  : `✅ Saved — *${result.threadCount}* thread(s), *${result.messageCount}* message(s) embedded.`,
+              },
+            },
+            {
+              type: "context",
+              elements: [
+                {
+                  type: "mrkdwn",
+                  text: `MemGo · <@${command.user_id}> · <!date^${Math.floor(Date.now() / 1000)}^{time}|now>`,
+                },
+              ],
+            },
+          ],
+        });
+      } catch (err) {
+        console.error("❌ /memory save error:", err);
+        await respond({ replace_original: true, text: err.message });
+      }
       return;
     }
 

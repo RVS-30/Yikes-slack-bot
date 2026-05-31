@@ -214,7 +214,12 @@ export async function deleteThreadEmbedding(workspaceId, channelId, threadTs) {
 }
 
 //search threads - for RAG
-export async function searchThreads(workspaceId, embedding, allowedChannels, limit = 5) {
+export async function searchThreads(
+  workspaceId,
+  embedding,
+  allowedChannels,
+  limit = 5,
+) {
   const { rows } = await pool.query(
     `SELECT thread_ts, channel_id, content, message_count, last_message_at,
             1 - (embedding <=> $2::vector) AS similarity
@@ -284,7 +289,7 @@ export async function getDecisions(workspaceId, channelId, limit = 10) {
        AND m.deleted = false
      ORDER BY m.slack_timestamp DESC
      LIMIT $3`,
-    [workspaceId, channelId, limit]
+    [workspaceId, channelId, limit],
   );
   return rows;
 }
@@ -294,7 +299,7 @@ export async function upsertUserChannels(workspaceId, userId, channels) {
   if (!channels.length) return;
 
   const values = channels
-    .map((_, i) => `($1, $2, $${i * 3 + 3}, $${i * 3 + 4}, NOW())`)
+    .map((_, i) => `($1, $2, $${i * 2 + 3}, $${i * 2 + 4}::boolean, NOW())`)
     .join(", ");
 
   const params = [workspaceId, userId];
@@ -311,7 +316,7 @@ export async function upsertUserChannels(workspaceId, userId, channels) {
      DO UPDATE SET
        is_private = EXCLUDED.is_private,
        synced_at = NOW()`,
-    params
+    params,
   );
 }
 
@@ -322,7 +327,7 @@ export async function getAccessibleChannels(workspaceId, userId) {
      FROM user_channel_memberships
      WHERE workspace_id = $1
        AND user_id = $2`,
-    [workspaceId, userId]
+    [workspaceId, userId],
   );
   return rows.map((r) => r.channel_id);
 }
@@ -336,7 +341,7 @@ export async function isMembershipStale(workspaceId, userId) {
        AND user_id = $2
      ORDER BY synced_at DESC
      LIMIT 1`,
-    [workspaceId, userId]
+    [workspaceId, userId],
   );
 
   if (rows.length === 0) return true;
@@ -364,7 +369,13 @@ export async function getSummaryMessages(workspaceId, channelId, from, to) {
 }
 
 // Hybrid search — vector similarity + keyword fallback
-export async function searchHybrid(workspaceId, embedding, keyword, allowedChannels, limit = 5) {
+export async function searchHybrid(
+  workspaceId,
+  embedding,
+  keyword,
+  allowedChannels,
+  limit = 5,
+) {
   const { rows } = await pool.query(
     `SELECT thread_ts, channel_id, content, message_count, last_message_at,
             1 - (embedding <=> $2::vector) AS similarity
@@ -378,7 +389,32 @@ export async function searchHybrid(workspaceId, embedding, keyword, allowedChann
        )
      ORDER BY embedding <=> $2::vector
      LIMIT $5`,
-    [workspaceId, JSON.stringify(embedding), allowedChannels, `%${keyword}%`, limit]
+    [
+      workspaceId,
+      JSON.stringify(embedding),
+      allowedChannels,
+      `%${keyword}%`,
+      limit,
+    ],
+  );
+  return rows;
+}
+
+// Fetch recent messages for force-save — returns thread_ts for grouping
+export async function getRecentChannelMessages(
+  workspaceId,
+  channelId,
+  fromUnix,
+) {
+  const { rows } = await pool.query(
+    `SELECT user_id, text, slack_timestamp, thread_ts
+     FROM messages
+     WHERE workspace_id = $1
+       AND channel_id = $2
+       AND deleted = false
+       AND slack_timestamp::numeric >= $3
+     ORDER BY slack_timestamp ASC`,
+    [workspaceId, channelId, fromUnix],
   );
   return rows;
 }
