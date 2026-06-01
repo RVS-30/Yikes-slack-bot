@@ -1,589 +1,456 @@
-# MemGo Slack Bot — Architecture Flow Map & Complete Project Catalog
+# MemGo Slack Bot — Clean Architecture Flow Map
 
-This document is a technical audit of the **MemGo Slack Bot** codebase. It maps out every file in the project, details their exported functions, internal call chains, triggers, external service dependencies, and illustrates the structured flow of data across different architectural boundaries.
+This document is the **single truth source** for the MemGo Slack Bot architecture. It is arranged as one end-to-end flow from boot, to message ingestion, to background enrichment, to embedding refresh, to `/memory` command handling, and finally to the data access layer.
 
----
-
-## 🗺️ High-Level System Architecture
-
-The MemGo bot is structured around a decoupled, multi-tier layout:
-1. **Trigger & Listener Layer**: Captures events (Slack Webhooks for messages, mentions, and commands).
-2. **Business Services Layer**: Coordinates domain operations (RAG, summarization, vector database indexing, security checks, context sessioning).
-3. **Queues & Background Workers Layer**: Defers compute-heavy tasks (AI categorization, vector calculations) using Redis-backed queues and scheduling crons.
-4. **Data Repository Layer**: Centralizes all SQL statements and isolates Supabase/PostgreSQL schema operations.
-5. **Models Layer**: Transforms raw JSON web payloads into structured data models.
-
-```
-       [ Slack Event Hook ]                   [ Slack Command /memory ]
-                │                                         │
-        ┌───────▼────────────────────────┐        ┌───────▼────────────────────────┐
-        │  listeners/events/message.js   │        │ listeners/commands/memory.js   │
-        └───────┬────────────────────────┘        └───────┬────────────────────────┘
-                │ (async/non-blocking)                    │ (RAG / Search / Summarize)
-        ┌───────▼────────────────────────┐                │
-        │   services/message.service.js  │        ┌───────▼────────────────────────┐
-        └───────┬──────────────┬─────────┘        │     services/rag.service.js    │
-                │              │                  │     services/search.service.js │
-        ┌───────▼─────┐  ┌─────▼─────────┐        │     services/summary.service.js│
-        │ insertMessage│  │  BullMQ Queue │        └───────┬──────────────────┬─────┘
-        └───────┬─────┘  └─────┬─────────┘                │                  │
-                │              │ (async/non-blocking)     │ (Vector embed)   │ (SQL Gated)
-        ┌───────▼─────┐  ┌─────▼─────────┐        ┌───────▼─────────┐  ┌─────▼─────────────┐
-        │ PostgreSQL  │  │ Redis (Queue) │        │ Gemini API (AI) │  │message.repository │
-        └─────────────┘  └─────┬─────────┘        └─────────────────┘  └─────┬─────────────┘
-                               │                                             │ (pgvector cosine)
-                         ┌─────▼─────────┐                             ┌─────▼─────────────┐
-                         │ BullMQ Worker │                             │   PostgreSQL DB   │
-                         └─────┬─────────┘                             └───────────────────┘
-                               │ (Gemini classification)
-                         ┌─────▼──────────────┐
-                         │  awareness.worker  │
-                         └────────────────────┘
-```
+The goal is to keep the structure **clean, non-conflicting, and sequential** so the same file can be used as a reference for implementation and review.
 
 ---
 
-## 1️⃣ Layered Call Chains & Flow Trees
-
-Here are the interactive data flows representing the ingestion pipelines, worker executions, and command invocations.
-
-### A. Real-Time Message Ingestion & Background Enrichment Flow
-When a user posts a message, it is saved immediately, while AI classification and name caches are handled in parallel in an asynchronous, non-blocking fashion.
+## 1) Canonical System Flow
 
 ```mermaid
-graph TD
-    SlackEvent[Slack Message Received] -->|Trigger: HTTPS Webhook| MessageListener["listeners/events/message.js (registerMessage)"]
-    
-    %% Standard Ingestion
-    MessageListener -->|New User Message| InIncoming["services/message.service.js: handleIncomingMessage()"]
-    InIncoming -->|1. Create structure| ModelParser["models/message.model.js: createMessageEntity()"]
-    InIncoming -->|2. Write RAW message| RepoInsert["repositories/message.repository.js: insertMessage()"]
-    RepoInsert -->|Postgres SQL| PostgresDB[(PostgreSQL DB)]
-    
-    %% Non-blocking user caching
-    InIncoming -->|3. Async User Cache| BackgroundResolve["services/message.service.js: resolveAndCacheUser()"]
-    style BackgroundResolve stroke:#33f,stroke-width:2px;
-    BackgroundResolve -->|Slack WebClient API| SlackUserAPI["client.users.info"]
-    BackgroundResolve -->|Cache display name| RepoUpsertUser["repositories/message.repository.js: upsertUser()"]
-    RepoUpsertUser --> PostgresDB
-    
-    %% Non-blocking Queue push
-    InIncoming -->|4. Async Job Queue| QueuePush["queues/awareness.queue.js (awarenessQueue.add)"]
-    style QueuePush stroke:#33f,stroke-width:2px;
-    QueuePush -->|Save Job| RedisDB[(Redis Cache)]
-    
-    %% Message Edits/Deletes
-    MessageListener -->|Edited Message| InEdit["services/message.service.js: handleMessageEdit()"]
-    InEdit -->|Update DB text| RepoUpdate["repositories/message.repository.js: updateMessageText()"]
-    RepoUpdate --> PostgresDB
-    InEdit -->|Flag thread dirty| RepoDirty["repositories/message.repository.js: upsertThreadDirty()"]
-    RepoDirty --> PostgresDB
-    
-    MessageListener -->|Deleted Message| InDelete["services/message.service.js: handleMessageDelete()"]
-    InDelete -->|Flag deleted in DB| RepoDelete["repositories/message.repository.js: markMessageDeleted()"]
-    RepoDelete --> PostgresDB
-    InDelete -->|Flag thread dirty| RepoDirty
-```
+flowchart TD
+    A[Server boot] --> B[index.js]
+    B --> C[env validation]
+    B --> D[PostgreSQL pool]
+    B --> E[register listeners]
+    B --> F[start awareness worker]
+    B --> G[start embedding scheduler]
 
-### B. BullMQ Asynchronous Awareness Worker Pipeline
-The BullMQ worker runs as a background process, consuming classification jobs generated by message ingestion.
+    E --> H[Slack events]
+    H --> I[app_mention]
+    H --> J[message events]
+    H --> K[/memory command]
 
-```mermaid
-graph TD
-    WorkerProcess["workers/startAwarenessWorker.js (Self-executing Daemon)"] -->|Poll Queue| Redis[(Redis Job Cache)]
-    WorkerProcess -->|Process Job| WorkerHandler["workers/awareness.worker.js: runAwarenessWorker()"]
-    
-    WorkerHandler -->|1. Fetch unprocessed text| RepoGet["repositories/message.repository.js: getMessageById()"]
-    RepoGet --> Postgres[(PostgreSQL DB)]
-    
-    WorkerHandler -->|2. Categorize content| AICat["services/awareness.service.js: classifyMessage()"]
-    AICat -->|Gemini API Call| GeminiClassify["gemini-2.5-flash (JSON Mode)"]
-    
-    WorkerHandler -->|3. Write enrichment| RepoEnrich["repositories/message.repository.js: updateMessageEnrichment()"]
-    RepoEnrich --> Postgres
-    
-    WorkerHandler -->|4. If threaded, flag dirty| RepoDirty["repositories/message.repository.js: upsertThreadDirty()"]
-    RepoDirty --> Postgres
-```
+    J --> L[message.service.js]
+    L --> M[insert raw message]
+    L --> N[resolve and cache user]
+    L --> O[enqueue awareness job]
 
-### C. The 5-Minute Embedding Scheduler Cron
-A lightweight cron job checks the database for dirty threads and calculates their updated embeddings in a bulk process.
+    O --> P[BullMQ + Redis]
+    P --> Q[awareness.worker.js]
+    Q --> R[classifyMessage]
+    Q --> S[update message enrichment]
+    Q --> T[mark thread dirty]
 
-```mermaid
-graph TD
-    CronJob["node-cron ('*/5 * * * *')"] -->|Trigger every 5 min| Scheduler["schedulers/embedding.scheduler.js: startEmbeddingScheduler()"]
-    
-    Scheduler -->|1. Fetch needs_embedding=true| RepoGetDirty["repositories/message.repository.js: getDirtyThreads()"]
-    RepoGetDirty --> Postgres[(PostgreSQL DB)]
-    
-    Scheduler -->|2. Loop & Fetch thread messages| RepoGetThread["repositories/message.repository.js: getThreadMessages()"]
-    RepoGetThread --> Postgres
-    
-    Scheduler -->|3. Resolve active names| RepoGetUsers["repositories/message.repository.js: getUsersByIds()"]
-    RepoGetUsers --> Postgres
-    
-    Scheduler -->|4. Form plain text block| ServiceBuild["services/embedding.service.js: buildThreadContent()"]
-    
-    Scheduler -->|5. Compute embedding vector| ServiceEmbed["services/embedding.service.js: generateEmbedding()"]
-    ServiceEmbed -->|Gemini Embedding API| GeminiSDK["gemini-embedding-001 (768-dim)"]
-    
-    Scheduler -->|6. Save vector & clear flag| RepoUpsertEmbed["repositories/message.repository.js: upsertThreadEmbedding()"]
-    RepoUpsertEmbed --> Postgres
-    
-    Scheduler -->|7. Delete empty threads| RepoDeleteEmbed["repositories/message.repository.js: deleteThreadEmbedding()"]
-    RepoDeleteEmbed --> Postgres
-```
+    G --> U[embedding.scheduler.js]
+    U --> V[find dirty threads]
+    U --> W[build thread content]
+    U --> X[generate embedding]
+    U --> Y[upsert thread embedding]
 
-### D. `/memory` Slash Command Interactions
-The user controls memory queries, decisions, updates, and indexing requests synchronously from the Slack command interface.
+    K --> Z[memory listeners]
+    Z --> ZA[ask]
+    Z --> ZB[search]
+    Z --> ZC[summarize]
+    Z --> ZD[decisions]
+    Z --> ZE[save thread or channel]
 
-```mermaid
-graph TD
-    UserCommand["User inputs: /memory <subcommand>"] -->|Slack Trigger| CommandListener["listeners/commands/memory.js (registerMemoryCommand)"]
-    CommandListener -->|Immediate Acknowledge| SlackAck["ack()"]
-    
-    %% RAG ASK FLOW
-    CommandListener -->|'ask <question>'| AskService["services/rag.service.js: answerFromMemory()"]
-    AskService -->|Context fetch| GetContext["services/context.service.js: getContextForCommand()"]
-    GetContext --> Postgres[(PostgreSQL DB)]
-    
-    AskService -->|Membership check| MemberCheck["services/membership.service.js: resolveAccessibleChannels()"]
-    MemberCheck -->|Is cached?| CacheCheck["repositories/message.repository.js: isMembershipStale()"]
-    MemberCheck -->|No: Sync Slack API| SlackConversations["client.users.conversations"]
-    MemberCheck -->|Save membership| RepoSaveMembership["repositories/message.repository.js: upsertUserChannels()"]
-    MemberCheck -->|Fetch accessible| RepoGetMembership["repositories/message.repository.js: getAccessibleChannels()"]
-    
-    AskService -->|Compute Query Vector| GeminiEmbed["services/embedding.service.js: generateEmbedding()"]
-    GeminiEmbed -->|Gemini Embedding| EmbedSDK["gemini-embedding-001 (768-dim)"]
-    
-    AskService -->|Channel-gated vector query| RepoSearchThreads["repositories/message.repository.js: searchThreads()"]
-    RepoSearchThreads --> Postgres
-    
-    AskService -->|Formulate prompt & QA| GeminiQA["gemini-2.5-flash"]
-    AskService -->|Async Audit Log| LogInteraction["services/context.service.js: logInteraction()"]
-    LogInteraction --> Postgres
-    
-    %% HYBRID SEARCH FLOW
-    CommandListener -->|'search <query>'| SearchService["services/search.service.js: searchMemory()"]
-    SearchService --> GetContext
-    SearchService --> MemberCheck
-    SearchService --> GeminiEmbed
-    SearchService -->|Vector + Keyword match| RepoSearchHybrid["repositories/message.repository.js: searchHybrid()"]
-    RepoSearchHybrid --> Postgres
-    SearchService --> LogInteraction
-    
-    %% SUMMARIZE FLOW
-    CommandListener -->|'summarize'| SummaryService["services/summary.service.js: summarizeChannel()"]
-    SummaryService --> GetContext
-    SummaryService -->|Get last 7 days text| RepoGetSummary["repositories/message.repository.js: getSummaryMessages()"]
-    RepoGetSummary --> Postgres
-    SummaryService -->|Summarize channel| GeminiQA
-    SummaryService --> LogInteraction
-    
-    %% DECISIONS FLOW
-    CommandListener -->|'decisions'| RepoGetDecisions["repositories/message.repository.js: getDecisions()"]
-    RepoGetDecisions --> Postgres
-    CommandListener --> LogInteraction
-    
-    %% SAVE THREAD/CHANNEL FLOW
-    CommandListener -->|'save <url>'| SaveThread["services/save.service.js: saveThread()"]
-    SaveThread --> MemberCheck
-    SaveThread --> RepoGetThread
-    SaveThread --> RepoGetUsers
-    SaveThread --> ServiceBuild
-    SaveThread --> ServiceEmbed
-    SaveThread --> RepoUpsertEmbed
-    
-    CommandListener -->|'save' (no url)| SaveChannel["services/save.service.js: saveChannel()"]
-    SaveChannel --> MemberCheck
-    SaveChannel -->|Fetch last 30 mins| RepoGetRecent["repositories/message.repository.js: getRecentChannelMessages()"]
-    RepoGetRecent --> Postgres
-    SaveChannel --> Group["Group messages into threads"]
-    Group --> RepoGetUsers
-    Group --> ServiceBuild
-    Group --> ServiceEmbed
-    Group --> RepoUpsertEmbed
+    ZA --> ZF[rag.service.js]
+    ZB --> ZG[search.service.js]
+    ZC --> ZH[summary.service.js]
+    ZD --> ZI[message.repository.js]
+    ZE --> ZJ[save.service.js]
+
+    ZF --> ZK[context + membership + embedding + Gemini]
+    ZG --> ZK
+    ZH --> ZK
+    ZI --> ZL[filtered SQL lookup]
+    ZJ --> ZM[thread/channel embedding now]
 ```
 
 ---
 
-## 2️⃣ Comprehensive File-by-File Technical Directory
+## 2) Boot Sequence
 
-A exhaustive file mapping with signatures, logic, internal call hierarchies, and direct external service connections.
+The application starts in this order:
 
-### Root Directory
+1. `index.js`
+2. `src/config/environment.js`
+3. `src/config/database.js`
+4. `src/listeners/index.js`
+5. `src/workers/startAwarenessWorker.js`
+6. `src/schedulers/embedding.scheduler.js`
 
-#### `index.js`
-*   **Layer**: Main Entry Point
-*   **Exported Functions**: None
-*   **Triggers / Event Listeners**: Runs on application boot
-*   **Call Chain / Core Logic**:
-    *   Imports `app` and `config` from `src/app.js`.
-    *   Imports `pool` from `src/config/database.js`.
-    *   Imports `startEmbeddingScheduler` from `src/schedulers/embedding.scheduler.js`.
-    *   Performs database connection sanity check (`await pool.query("SELECT 1")`) (**blocking**).
-    *   Starts the Slack app server (`await app.start(config.port)`) (**blocking**).
-    *   Triggers the embedding cron job scheduler (`startEmbeddingScheduler()`) (**async / non-blocking**).
-*   **External Services Touched**: PostgreSQL (connection test), Slack HTTP Port.
+### Boot responsibilities
 
-#### `debug.js`
-*   **Layer**: Utility Scripts
-*   **Exported Functions**: None (Executed as standalone utility: `node debug.js`)
-*   **Triggers / Event Listeners**: Executed manually during testing
-*   **Call Chain / Core Logic**:
-    *   Queries `messages` database table for entries having `user_id` without matching `users` records (**blocking**).
-    *   For each unique missing user:
-        *   Retrieves real name and display configurations from Slack API (`client.users.info`) (**blocking**).
-        *   Upserts names to user cache via `upsertUser()` from `message.repository.js` (**blocking**).
-*   **External Services Touched**: Slack API (`users.info`), PostgreSQL (write operations).
+- `environment.js` validates required environment variables.
+- `database.js` creates the PostgreSQL pool.
+- `listeners/index.js` registers all Slack listeners and commands.
+- `startAwarenessWorker.js` starts the BullMQ worker daemon.
+- `embedding.scheduler.js` starts the 5-minute cron job.
 
 ---
 
-### `src/config/` (Configuration Layer)
+## 3) Message Ingestion Flow
 
-#### `src/config/database.js`
-*   **Layer**: Configuration
-*   **Exported Functions**: `default` (Instance of `pg.Pool`)
-*   **Triggers / Event Listeners**: Initiated on module load
-*   **Call Chain / Core Logic**:
-    *   Initializes PostgreSQL client connection pool using `DATABASE_URL`.
-    *   Configures pool parameters: SSL authorized, 15-second connect timeout, 15-second query execution ceiling.
-    *   Logs connection events (`pool.on("connect")`) and connection failures (`pool.on("error")`).
-*   **External Services Touched**: PostgreSQL.
+This is the main real-time Slack event path.
 
-#### `src/config/environment.js`
-*   **Layer**: Configuration
-*   **Exported Functions**: `config` (Parsed configurations object)
-*   **Triggers / Event Listeners**: Runs on module import
-*   **Call Chain / Core Logic**:
-    *   Checks for the existence of required environment variables: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `GEMINI_API_KEY`, `REDIS_URL`, `DATABASE_URL`.
-    *   Throws descriptive startup error if any key is missing.
-    *   Parses port defaults (`PORT` or fallback to `4390`).
-*   **External Services Touched**: Node Process Environment.
+### 3.1 Entry point
 
----
+`src/listeners/events/message.js` receives Slack `message` events.
 
-### `src/middleware/` (Server Middleware Layer)
+### 3.2 Event routing
 
-#### `src/middleware/logger.middleware.js`
-*   **Layer**: Middleware
-*   **Exported Functions**: `loggerMiddleware({ body, next })`
-*   **Triggers / Event Listeners**: Intercepts every incoming Slack Webhook event
-*   **Call Chain / Core Logic**:
-    *   Captures timestamp, event payload type, trigger channel, trigger user, and message preview.
-    *   Logs formatting data into standard console output stream.
-    *   Yields execution to downstream handlers using `await next()`.
-*   **External Services Touched**: Standard console stdout.
+The handler follows this order:
 
----
+1. Ignore bot messages.
+2. Handle `message_changed` via `handleMessageEdit()`.
+3. Handle `message_deleted` via `handleMessageDelete()`.
+4. For normal messages, call `handleIncomingMessage()`.
 
-### `src/utils/` (Utility Layer)
+### 3.3 Important guards
 
-#### `src/utils/text.utils.js`
-*   **Layer**: Utilities
-*   **Exported Functions**:
-    *   `truncateText(text, maxLength = 100)`: Safely cuts string to size and appends ellipsis.
-    *   `truncateForSlack(text, limit = 2900)`: Specialized Slack truncation utility. Leaves safe margin below Slack's strict 3,000-character block size limits and adds standard footer notice.
-*   **Triggers / Event Listeners**: None
-*   **Call Chain / Core Logic**: Pure text truncation utility functions.
-*   **External Services Touched**: None.
+- Direct messages and multi-party DMs are skipped in `handleIncomingMessage()` so private content is not indexed.
+- This keeps the memory store focused on workspace channel content.
+
+### 3.4 What `handleIncomingMessage()` does
+
+`src/services/message.service.js` performs:
+
+- `createMessageEntity()` from `src/models/message.model.js`
+- `insertMessage()` into PostgreSQL
+- `resolveAndCacheUser()` in the background
+- `awarenessQueue.add()` for async classification
+
+### 3.5 User caching
+
+`resolveAndCacheUser()` calls Slack `client.users.info()` and stores the display profile with `upsertUser()`.
+
+### 3.6 Result of ingestion
+
+A message is stored immediately, while enrichment happens asynchronously.
 
 ---
 
-### `src/models/` (Data Model Layer)
+## 4) Edit and Delete Flow
 
-#### `src/models/message.model.js`
-*   **Layer**: Models
-*   **Exported Functions**: `createMessageEntity(event, body)`
-*   **Triggers / Event Listeners**: Called inside message handler pipelines
-*   **Call Chain / Core Logic**:
-    *   Accepts raw Slack payload body and event.
-    *   Maps payload properties into standardized DB schemas (isolates workspace, channel IDs, user tags, timestamps, text bodies, payloads).
-*   **External Services Touched**: None.
+Message lifecycle handling is part of the same message listener.
 
----
+### 4.1 Edit
 
-### `src/listeners/` (Trigger & Event Hook Layer)
+When Slack emits `message_changed`:
 
-#### `src/listeners/index.js`
-*   **Layer**: Listeners Root
-*   **Exported Functions**: `registerListeners(app)`
-*   **Triggers / Event Listeners**: Runs during main application bootstrap
-*   **Call Chain / Core Logic**:
-    *   Calls `registerAppMention(app)` from `./events/app-mention.js`.
-    *   Calls `registerMessage(app)` from `./events/message.js`.
-    *   Calls `registerMemoryCommand(app)` from `./commands/memory.js`.
-*   **External Services Touched**: Slack Bolt application instance registration.
+- `handleMessageEdit()` runs
+- `updateMessageText()` updates the stored text
+- `upsertThreadDirty()` marks the parent thread for re-embedding
 
-#### `src/listeners/events/app-mention.js`
-*   **Layer**: Event Handlers
-*   **Exported Functions**: `registerAppMention(app)`
-*   **Triggers / Event Listeners**: Triggers when the bot is tagged in a chat (`app_mention`)
-*   **Call Chain / Core Logic**:
-    *   Listens for `app_mention` webhook trigger.
-    *   Executes asynchronous, non-blocking call: `await say("👋 I'm alive!")`.
-*   **External Services Touched**: Slack Web API (`say` helper).
+### 4.2 Delete
 
-#### `src/listeners/events/message.js`
-*   **Layer**: Event Handlers
-*   **Exported Functions**: `registerMessage(app)`
-*   **Triggers / Event Listeners**: Triggers on any channel activity event (`message`)
-*   **Call Chain / Core Logic**:
-    *   Filters out messages originating from bots (`event.bot_id`).
-    *   Routes message events based on webhook subtype triggers:
-        *   `event.subtype === "message_changed"` (Edit): calls `handleMessageEdit(event, body)` (**blocking downstream**).
-        *   `event.subtype === "message_deleted"` (Delete): calls `handleMessageDelete(event, body)` (**blocking downstream**).
-        *   No subtype (New Message): calls `handleIncomingMessage(event, body, client)` (**blocking downstream**).
-*   **External Services Touched**: PostgreSQL, Redis Queue (triggered downstream inside message services).
+When Slack emits `message_deleted`:
 
-#### `src/listeners/commands/memory.js`
-*   **Layer**: Command Handlers
-*   **Exported Functions**: `registerMemoryCommand(app)`
-*   **Triggers / Event Listeners**: Triggers when a user invokes `/memory <subcommand>` slash command
-*   **Call Chain / Core Logic**:
-    *   Acknowledges webhook trigger immediately using `await ack()`.
-    *   Splits user command inputs into `subcommand` and `query` variables.
-    *   Matches subcommand trigger configurations:
-        *   **`ask`**: Replies with loading status $\rightarrow$ calls `answerFromMemory()` from `rag.service.js` $\rightarrow$ responds to user with output blocks.
-        *   **`decisions`**: Replies with loading status $\rightarrow$ calls `getDecisions()` from `message.repository.js` $\rightarrow$ parses lists $\rightarrow$ logs execution in background via `logInteraction()` from `context.service.js` (**non-blocking**).
-        *   **`summarize`**: Replies with loading status $\rightarrow$ calls `summarizeChannel()` from `summary.service.js` $\rightarrow$ checks truncation $\rightarrow$ posts public summary $\rightarrow$ triggers private user backup via `client.chat.postEphemeral` if truncated.
-        *   **`search`**: Replies with loading status $\rightarrow$ calls `searchMemory()` from `search.service.js` $\rightarrow$ displays deep-linked results.
-        *   **`save`**: Recognizes link inputs:
-            *   *With Slack URL*: calls `saveThread()` from `save.service.js`.
-            *   *Without URL*: calls `saveChannel()` from `save.service.js`.
-*   **External Services Touched**: Slack Web API (`respond`, `chat.postEphemeral`), PostgreSQL, Gemini API.
+- `handleMessageDelete()` runs
+- `markMessageDeleted()` soft-deletes the row
+- `upsertThreadDirty()` marks the thread dirty again
+
+### 4.3 Why this matters
+
+Any edit or delete can change the final thread meaning, so the embedding must be refreshed later by the scheduler.
 
 ---
 
-### `src/services/` (Core Business Logic Layer)
+## 5) Background Awareness Worker Flow
 
-#### `src/services/message.service.js`
-*   **Layer**: Services
-*   **Exported Functions**:
-    *   `handleIncomingMessage(event, body, client)`:
-        *   Blocks execution if message originates from a private DM channel (`im`/`mpim`).
-        *   Transforms raw payload to DB model using `createMessageEntity()`.
-        *   Inserts record using `insertMessage()` (**blocking DB call**).
-        *   Resolves user profiles in background via helper `resolveAndCacheUser()` (**async / non-blocking**).
-        *   Enqueues enrichment job: `awarenessQueue.add("classify", { messageId })` (**async / non-blocking**).
-    *   `handleMessageEdit(event, body)`:
-        *   Calls `updateMessageText()` (**blocking DB call**).
-        *   Flags parent thread dirty: `upsertThreadDirty()` (**blocking DB call**).
-    *   `handleMessageDelete(event, body)`:
-        *   Calls `markMessageDeleted()` (**blocking DB call**).
-        *   Flags parent thread dirty: `upsertThreadDirty()` (**blocking DB call**).
-*   **Internal Functions**:
-    *   `resolveAndCacheUser(client, workspaceId, userId)`: Fetches profile configurations via `client.users.info` $\rightarrow$ commits cache using `upsertUser()`.
-*   **External Services Touched**: Slack API (`users.info`), PostgreSQL, Redis Queue (`awarenessQueue`).
+This is the asynchronous enrichment pipeline.
 
-#### `src/services/awareness.service.js`
-*   **Layer**: Services
-*   **Exported Functions**: `classifyMessage(text)`
-*   **Triggers / Event Listeners**: Executed inside background queue processing worker
-*   **Call Chain / Core Logic**:
-    *   Performs early return if string text is shorter than 3 characters.
-    *   Formulates a strict JSON-forcing categorization prompt instruction.
-    *   Sends request to AI using Google Gen AI SDK: `genAI.models.generateContent({ model: "gemini-2.5-flash", contents })`.
-    *   Strips formatting artifacts (like markdown ` ```json ` blocks) from model responses.
-    *   Parses string using `JSON.parse()` and returns attributes map.
-    *   Returns default categorization mapping on execution error (resilient architecture).
-*   **External Services Touched**: Gemini API (`gemini-2.5-flash`).
+### 5.1 Queue
 
-#### `src/services/embedding.service.js`
-*   **Layer**: Services
-*   **Exported Functions**:
-    *   `buildThreadContent(messages, usersMap = {})`: Loops over thread message arrays, replaces user IDs with cached display names, appends human-readable dates, and merges them into one formatted plaintext block.
-    *   `generateEmbedding(content)`: Generates high-dimensional vector embeddings using Gemini SDK: `genAI.models.embedContent({ model: "gemini-embedding-001", contents })` (**blocking**).
-*   **Triggers / Event Listeners**: None
-*   **External Services Touched**: Gemini API (`gemini-embedding-001`).
+`src/queues/awareness.queue.js` creates the BullMQ queue on Redis.
 
-#### `src/services/rag.service.js`
-*   **Layer**: Services
-*   **Exported Functions**: `answerFromMemory(workspaceId, userId, channelId, question, client)`
-*   **Triggers / Event Listeners**: Triggered by `/memory ask` slash command
-*   **Call Chain / Core Logic**:
-    *   Retrieves session logs using `getContextForCommand()` from `context.service.js` (**blocking**).
-    *   Resolves accessible channel list using `resolveAccessibleChannels()` from `membership.service.js` (**blocking**).
-    *   Returns fallback notice immediately if the user is not present in any channels.
-    *   Converts query question to vector via `genAI.models.embedContent` (**blocking**).
-    *   Runs cosine similarity lookup gated by channel permissions using `searchThreads()` from `message.repository.js` (**blocking**).
-    *   Extracts already-used threads from prior session context, deduplicating them against vector query results.
-    *   Builds prompt combining user profile history, vector context, timeline reasoning guidelines, and target query.
-    *   Triggers generation request: `genAI.models.generateContent({ model: "gemini-2.5-flash", contents })` (**blocking**).
-    *   Persists audit records using `logInteraction()` from `context.service.js` (**async / non-blocking**).
-*   **External Services Touched**: Gemini API (`gemini-embedding-001`, `gemini-2.5-flash`), PostgreSQL (read and write operations).
+### 5.2 Worker
 
-#### `src/services/summary.service.js`
-*   **Layer**: Services
-*   **Exported Functions**: `summarizeChannel(workspaceId, userId, channelId, client)`
-*   **Triggers / Event Listeners**: Triggered by `/memory summarize` slash command
-*   **Call Chain / Core Logic**:
-    *   Computes epoch boundaries for target date range (past 7 days).
-    *   Fetches session context: `getContextForCommand()` from `context.service.js` (**blocking**).
-    *   Fetches message arrays: `getSummaryMessages()` from `message.repository.js` (**blocking**).
-    *   Constructs a summary prompt with temporal reasoning instructions (reframing deadlines, dates, and overdue tasks).
-    *   Calls Gemini to summarize: `genAI.models.generateContent({ model: "gemini-2.5-flash", contents })` (**blocking**).
-    *   Saves interaction logs in background via `logInteraction()` (**async / non-blocking**).
-*   **External Services Touched**: Gemini API (`gemini-2.5-flash`), PostgreSQL (read and write operations).
+`src/workers/startAwarenessWorker.js` starts a `Worker` listening to the `awareness` queue.
 
-#### `src/services/search.service.js`
-*   **Layer**: Services
-*   **Exported Functions**: `searchMemory(workspaceId, userId, channelId, query, client)`
-*   **Triggers / Event Listeners**: Triggered by `/memory search` slash command
-*   **Call Chain / Core Logic**:
-    *   Fetches session context: `getContextForCommand()` from `context.service.js` (**blocking**).
-    *   Resolves accessible channels list: `resolveAccessibleChannels()` from `membership.service.js` (**blocking**).
-    *   Generates query vector embedding: `genAI.models.embedContent` (**blocking**).
-    *   Performs dual-mode search using `searchHybrid()` from `message.repository.js` (**blocking**).
-    *   Maps result datasets to matching percentages and Slack archive URLs.
-    *   Saves query logs in background via `logInteraction()` (**async / non-blocking**).
-*   **External Services Touched**: Gemini API (`gemini-embedding-001`), PostgreSQL (read and write operations).
+### 5.3 Job execution
 
-#### `src/services/membership.service.js`
-*   **Layer**: Services
-*   **Exported Functions**: `resolveAccessibleChannels(client, workspaceId, userId)`
-*   **Triggers / Event Listeners**: Instigated by secure search/RAG execution gates
-*   **Call Chain / Core Logic**:
-    *   Queries membership stale state: `isMembershipStale()` from `message.repository.js` (**blocking**).
-    *   If cache is valid: Fetches cached IDs from DB using `getAccessibleChannels()` and returns them (**blocking**).
-    *   If cache is stale (>10 min): Triggers private syncing helper `syncUserChannels()` (**blocking**).
-*   **Internal Functions**:
-    *   `syncUserChannels(client, workspaceId, userId)`:
-        *   Iteratively queries user channels from Slack API (`client.users.conversations`) to handle pagination.
-        *   Upserts updated membership mapping to DB using `upsertUserChannels()`.
-        *   Returns active channel ID array.
-*   **External Services Touched**: Slack API (`users.conversations`), PostgreSQL (cache lookups and updates).
+`src/workers/awareness.worker.js`:
 
-#### `src/services/save.service.js`
-*   **Layer**: Services
-*   **Exported Functions**:
-    *   `saveThread(workspaceId, userId, url, client)`:
-        *   Parses Slack channel ID and timestamp from link string.
-        *   Resolves user access permissions via `resolveAccessibleChannels()`.
-        *   Fetches matching messages from DB via `getThreadMessages()`.
-        *   Fetches user display names via `getUsersByIds()`.
-        *   Builds text block and creates vector via `buildThreadContent()` and `generateEmbedding()`.
-        *   Saves embedding directly, resetting the dirty flag using `upsertThreadEmbedding()`.
-    *   `saveChannel(workspaceId, userId, channelId, client)`:
-        *   Checks user access permissions via `resolveAccessibleChannels()`.
-        *   Fetches channel messages from the last 30 minutes via `getRecentChannelMessages()`.
-        *   Groups messages into thread sets.
-        *   For each thread set:
-            *   Resolves display names, builds text block, generates vector embedding, and commits to DB via `upsertThreadEmbedding()`.
-*   **Internal Functions**:
-    *   `parseSlackUrl(url)`: Extracts channel ID and thread timestamp (`thread_ts`) from matching URL formats.
-*   **External Services Touched**: Gemini API (`gemini-embedding-001`), PostgreSQL.
+1. Reads `messageId`
+2. Fetches the message from PostgreSQL
+3. Calls `classifyMessage()`
+4. Updates enrichment fields in `messages`
+5. Marks the thread dirty if needed
 
-#### `src/services/context.service.js`
-*   **Layer**: Services
-*   **Exported Functions**:
-    *   `getContextForCommand(workspaceId, userId, channelId, commandType, client)`:
-        *   Reads matching context types from `CONTEXT_REGISTRY`.
-        *   Queries `interaction_log` database table for interactions within the last 2 hours (**blocking**).
-        *   Gates retrieved logs using `getAccessibleChannels()` from `message.repository.js` if Bolt client instance is active.
-        *   Reverses chronological sorting and returns array dataset.
-    *   `formatContextForPrompt(contextRows)`: Maps array of log rows into a single prompt-injectable context history block.
-    *   `logInteraction(workspaceId, userId, channelId, commandType, input, output, metadata = {})`: Commits transaction record to `interaction_log` table (**blocking DB write**).
-*   **External Services Touched**: PostgreSQL (read and write operations).
+### 5.4 AI classification
+
+`src/services/awareness.service.js` sends text to Gemini and expects a structured JSON classification result.
+
+### 5.5 Output fields
+
+The worker stores data such as:
+
+- `message_type`
+- `importance_score`
+- `entities`
+- `topic_tags`
+- `processed = true`
 
 ---
 
-### `src/queues/` & `src/workers/` (Queue & Background Execution Layer)
+## 6) Thread Embedding Scheduler Flow
 
-#### `src/queues/awareness.queue.js`
-*   **Layer**: Queues
-*   **Exported Functions**: `awarenessQueue` (Instance of BullMQ `Queue`)
-*   **Triggers / Event Listeners**: Job enqueue producer
-*   **Call Chain / Core Logic**:
-    *   Establishes client connection to Redis using `ioredis`.
-    *   Initializes BullMQ Queue instance named `"awareness"`.
-    *   Defines failure retry policies (3 attempts, exponential backoff starting at 2 seconds, auto-cleanup settings).
-*   **External Services Touched**: Redis (RedisLabs connection).
+This is separate from the awareness worker.
 
-#### `src/workers/awareness.worker.js`
-*   **Layer**: Workers
-*   **Exported Functions**: `runAwarenessWorker(jobData)`
-*   **Triggers / Event Listeners**: Invoked inside BullMQ worker callback execution loops
-*   **Call Chain / Core Logic**:
-    *   Pulls `messageId` from job dataset.
-    *   Queries target message details via `getMessageById(messageId)` (**blocking DB check**).
-    *   Runs AI classifier service: `classifyMessage(msg.text)` (**blocking API request**).
-    *   Commits enrichment results using `updateMessageEnrichment()` (**blocking DB write**).
-    *   If thread timestamp is set, flags thread dirty using `upsertThreadDirty()` (**blocking DB write**).
-*   **External Services Touched**: Gemini API (via classifier), PostgreSQL (read and write operations).
+### 6.1 Trigger
 
-#### `src/workers/startAwarenessWorker.js`
-*   **Layer**: Workers
-*   **Exported Functions**: None (Executed as standalone worker daemon process: `node src/workers/startAwarenessWorker.js`)
-*   **Triggers / Event Listeners**: Actively polls the `"awareness"` queue in Redis
-*   **Call Chain / Core Logic**:
-    *   Establishes connection to Redis using `ioredis`.
-    *   Spins up BullMQ `Worker` instance to process jobs from the `"awareness"` queue.
-    *   On job receipt: executes `runAwarenessWorker(job.data)`.
-    *   Handles worker event listeners: `ready`, `completed`, `failed`, and `retrying`.
-*   **External Services Touched**: Redis, PostgreSQL (downstream), Gemini API (downstream).
+`src/schedulers/embedding.scheduler.js` runs every 5 minutes.
+
+### 6.2 What it does
+
+For each dirty thread:
+
+1. Fetch thread messages
+2. Fetch user display names
+3. Build a clean text block
+4. Generate the embedding
+5. Save the thread embedding
+6. Clear the dirty flag
+
+### 6.3 Why it is separate
+
+- The awareness worker classifies individual messages.
+- The embedding scheduler rebuilds thread-level semantic memory.
+
+### 6.4 Thread-level storage
+
+`message.repository.js` stores one embedding per thread, not per message.
 
 ---
 
-### `src/schedulers/` (Scheduler Cron Layer)
+## 7) `/memory` Command Flow
 
-#### `src/schedulers/embedding.scheduler.js`
-*   **Layer**: Schedulers
-*   **Exported Functions**: `startEmbeddingScheduler()`
-*   **Triggers / Event Listeners**: Cron schedule trigger: `*/5 * * * *` (Every 5 minutes)
-*   **Call Chain / Core Logic**:
-    *   Registers background cron schedule using `node-cron`.
-    *   At each 5-minute interval:
-        *   Retrieves threads with `needs_embedding = true` via `getDirtyThreads()` (**blocking DB check**).
-        *   If no dirty threads are returned, exits early.
-        *   For each dirty thread entry:
-            *   Fetches thread messages using `getThreadMessages()` (**blocking DB query**).
-            *   *If message count is 0*: Removes empty thread database tracking row via `deleteThreadEmbedding()`.
-            *   Resolves distinct message authors using `getUsersByIds()` cache lookup (**blocking DB check**).
-            *   Builds flat string format using `buildThreadContent()` from `embedding.service.js`.
-            *   Computes updated vector embedding using `generateEmbedding()` from `embedding.service.js` (**blocking API request**).
-            *   Writes embedding vector dataset and resets dirty status using `upsertThreadEmbedding()` (**blocking DB write**).
-*   **External Services Touched**: PostgreSQL (read and write operations), Gemini API (`gemini-embedding-001` via embedding service).
+`src/listeners/commands/memory.js` is the user-facing memory entry point.
+
+### 7.1 Common command behavior
+
+- Calls `ack()` immediately.
+- Reads the subcommand.
+- Uses shared context and permissions before any sensitive lookup.
+- Logs interaction data for later session memory.
+
+### 7.2 `ask`
+
+Flow:
+
+- `getContextForCommand()`
+- `resolveAccessibleChannels()`
+- `generateEmbedding()` for the question
+- `searchThreads()` gated by channel access
+- Gemini answer generation
+- `logInteraction()`
+
+### 7.3 `search`
+
+Flow:
+
+- `getContextForCommand()`
+- `resolveAccessibleChannels()`
+- `generateEmbedding()`
+- `searchHybrid()`
+- `logInteraction()`
+
+### 7.4 `summarize`
+
+Flow:
+
+- `getContextForCommand()`
+- `getSummaryMessages()`
+- Gemini summary generation
+- `logInteraction()`
+
+### 7.5 `decisions`
+
+Flow:
+
+- `getDecisions()`
+- formatted result response
+- `logInteraction()`
+
+### 7.6 `save`
+
+Flow:
+
+- `saveThread()` for a specific Slack URL
+- `saveChannel()` for the current channel window
+- both bypass the scheduled embedding wait and force an immediate save
 
 ---
 
-### `src/repositories/` (SQL Database Access Layer)
+## 8) Shared Security, Context, and Permission Layer
 
-All SQL queries and direct database interaction functions reside in this file.
+These are cross-cutting helpers used across `/memory` actions.
 
-#### `src/repositories/message.repository.js`
-*   **Layer**: Repositories
-*   **Exported Functions** (all return promises via PG Pool):
-    *   `insertMessage(message)`: Writes raw message attributes to `messages` table.
-    *   `updateMessageText({ workspace_id, channel_id, slack_timestamp, text, raw_payload })`: Updates text after a Slack edit.
-    *   `markMessageDeleted({ workspace_id, channel_id, slack_timestamp })`: Sets `deleted = true` flag.
-    *   `getMessageById(messageId)`: Fetches a single message where `processed = false`.
-    *   `updateMessageEnrichment(messageId, awareness)`: Commits message type, importance score, keyword entities, and topic tags. Marks `processed = true`.
-    *   `getThreadMessages(workspaceId, channelId, threadTs)`: Fetches non-deleted thread messages ordered by timestamp ascending.
-    *   `upsertThreadDirty(workspaceId, channelId, threadTs)`: Inserts or updates a thread record, flagging `needs_embedding = true`.
-    *   `getDirtyThreads()`: Selects threads with `needs_embedding = true`.
-    *   `upsertThreadEmbedding(workspaceId, channelId, threadTs, content, embedding, messageCount)`: Writes thread string text block and vector embedding dataset (`embedding vector(768)`). Sets `needs_embedding = false`.
-    *   `deleteThreadEmbedding(workspaceId, channelId, threadTs)`: Deletes embedding mapping row.
-    *   `searchThreads(workspaceId, embedding, allowedChannels, limit)`: Performs HNSW-indexed cosine distance calculations on thread vector embeddings. Gated by user channel permissions.
-    *   `searchHybrid(workspaceId, embedding, keyword, allowedChannels, limit)`: Dual search combining vector distance calculations with SQL `ILIKE` keyword patterns. Gated by user channel permissions.
-    *   `upsertUser(workspaceId, userId, displayName, avatarUrl)`: Caches/updates user display details.
-    *   `getUsersByIds(workspaceId, userIds)`: Resolves list of IDs to their display names.
-    *   `insertMemoryQuery(...)`: Legacy audit logging hook (superseded by interaction log service).
-    *   `getDecisions(workspaceId, channelId, limit)`: Selects messages flagged with `'decision'` type inside current channel.
-    *   `upsertUserChannels(workspaceId, userId, channels)`: Stores/syncs active channel list memberships.
-    *   `getAccessibleChannels(workspaceId, userId)`: Selects list of cached channel memberships for a user.
-    *   `isMembershipStale(workspaceId, userId)`: Checks if membership sync stamp is older than 10 minutes.
-    *   `getSummaryMessages(workspaceId, channelId, from, to)`: Fetches all active messages in a channel inside target timeframes.
-    *   `getRecentChannelMessages(workspaceId, channelId, fromUnix)`: Fetches recent channel messages for force-save triggers.
-*   **External Services Touched**: PostgreSQL (Supabase DB).
+### 8.1 Membership gate
+
+`src/services/membership.service.js`:
+
+- checks whether cached membership is stale
+- syncs `client.users.conversations` when needed
+- stores accessible channels in PostgreSQL
+
+This prevents the user from searching threads they should not see.
+
+### 8.2 Session context
+
+`src/services/context.service.js`:
+
+- reads recent command interactions
+- keeps a 2-hour context window
+- writes `interaction_log`
+- formats prior interactions for prompts
+
+### 8.3 Logging
+
+All major command flows write audit data through `logInteraction()`.
 
 ---
 
-## 3️⃣ Summary of External Services & Gateways
+## 9) File Catalog in Execution Order
 
-| Service | Protocol / Module | Core Target Operations | Security & Isolation Policies |
-|---|---|---|---|
-| **PostgreSQL (Supabase)** | `pg` connection pool | Stores messages, embeddings, user profiles, memberships, audit logs. | Channel gating at database SQL query levels; absolute isolation by `workspace_id`. |
-| **Gemini (Google Gen AI)** | `@google/genai` API SDK | Text embedding (`gemini-embedding-001`), text parsing / QA / summarization (`gemini-2.5-flash`). | Stateless payloads. Input validations and prompt instructions enforce factual containment boundaries. |
-| **Redis (RedisLabs)** | `ioredis` / BullMQ | Job queue hosting, queue coordination, backoff delay processing. | Queue scoped to local thread operations; tasks isolated inside BullMQ `"awareness"` namespace. |
-| **Slack Web API** | `@slack/bolt` / Web Client | Real-time events, user info lookup, conversations retrieval, posts. | Secure token isolation (`xoxb-...`); message ingestion blocks DMs (`im`/`mpim`) early to ensure private data remains local. |
+### 9.1 Root
+
+- `index.js` — boot entry point, starts DB check, listeners, worker, scheduler
+- `debug.js` — maintenance script for fixing missing user cache records
+
+### 9.2 Config
+
+- `src/config/environment.js` — validates required env values
+- `src/config/database.js` — PostgreSQL pool configuration
+
+### 9.3 Middleware
+
+- `src/middleware/logger.middleware.js` — request logging
+
+### 9.4 Utils
+
+- `src/utils/text.utils.js` — truncation helpers
+
+### 9.5 Models
+
+- `src/models/message.model.js` — transforms Slack payloads into a message entity
+
+### 9.6 Listeners
+
+- `src/listeners/index.js` — registers all listeners
+- `src/listeners/events/app-mention.js` — minimal mention response
+- `src/listeners/events/message.js` — new/edit/delete routing
+- `src/listeners/commands/memory.js` — `/memory` command entry point
+
+### 9.7 Services
+
+- `src/services/message.service.js` — ingestion, edits, deletes, user cache, queue push
+- `src/services/awareness.service.js` — Gemini message classification
+- `src/services/embedding.service.js` — build thread content and generate embeddings
+- `src/services/rag.service.js` — `ask` flow
+- `src/services/summary.service.js` — `summarize` flow
+- `src/services/search.service.js` — `search` flow
+- `src/services/membership.service.js` — accessible channel resolution
+- `src/services/save.service.js` — force-save thread or channel
+- `src/services/context.service.js` — session context and interaction logs
+
+### 9.8 Queue and worker
+
+- `src/queues/awareness.queue.js` — Redis queue definition
+- `src/workers/awareness.worker.js` — job processor
+- `src/workers/startAwarenessWorker.js` — worker daemon bootstrap
+
+### 9.9 Scheduler
+
+- `src/schedulers/embedding.scheduler.js` — 5-minute dirty-thread embedding refresh
+
+### 9.10 Repository
+
+- `src/repositories/message.repository.js` — all SQL access and PostgreSQL operations
+
+---
+
+## 10) Repository Responsibilities
+
+`message.repository.js` is the single SQL boundary for the project.
+
+It owns:
+
+- raw message insertion
+- edits and deletes
+- processed/enrichment updates
+- dirty thread tracking
+- thread embedding storage
+- hybrid search
+- accessible channel membership cache
+- user cache
+- summary queries
+- decision queries
+- recent channel message queries
+
+This keeps SQL isolated from the rest of the codebase.
+
+---
+
+## 11) External Services
+
+### PostgreSQL / Supabase
+
+Used for:
+
+- messages
+- users
+- thread embeddings
+- membership cache
+- interaction logs
+
+### Redis
+
+Used for:
+
+- BullMQ awareness jobs
+
+### Slack Web API
+
+Used for:
+
+- `users.info`
+- `users.conversations`
+- replying to commands and events
+
+### Gemini
+
+Used for:
+
+- message classification
+- embeddings
+- RAG answer generation
+- summaries
+- search response shaping
+
+---
+
+## 12) Clean Architectural Rule Set
+
+1. New Slack content enters through listeners only.
+2. Raw persistence happens before AI work.
+3. Message classification is async.
+4. Thread embeddings are cron-driven.
+5. `/memory` commands always check membership and context.
+6. All query-like flows log interaction history.
+7. PostgreSQL remains the source of truth.
+8. Redis is only for queueing.
+9. Gemini is only for inference and embedding.
+10. Private DMs stay out of the memory index.
+
+---
+
+## 13) What This Document Now Represents
+
+This version keeps the entire project in one consistent flow:
+
+- boot
+- event capture
+- storage
+- async enrichment
+- scheduled embeddings
+- command execution
+- permissions and context
+- repository boundaries
+- external dependencies
+
+It is meant to stay clean, linear, and conflict-free.
