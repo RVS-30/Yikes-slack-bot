@@ -23,7 +23,7 @@ Every decision, every discussion, every "we talked about this last month" — ca
 
 ## Architecture
 
-![Yikes Architecture](assets/architecture-diagram.png)
+![Yikes Architecture](./assets/Architecture-diagram.png)
 
 **Ingestion pipeline:** Every Slack message hits the `message` event listener → stored to PostgreSQL → pushed to BullMQ (Redis) → Awareness Worker enriches it with Gemini AI (classification, entity extraction, importance scoring) → thread dirty flag set.
 
