@@ -1,6 +1,6 @@
-# MemGo
+# Yikes
 
-**Your Slack workspace has a memory problem. MemGo fixes it.**
+**Your Slack workspace has a memory problem. Yikes fixes it.**
 
 Every decision, every discussion, every "we talked about this last month" — captured, embedded, and queryable. Not ephemeral summaries. Persistent, searchable, structured memory for your entire team.
 
@@ -8,7 +8,7 @@ Every decision, every discussion, every "we talked about this last month" — ca
 
 ## Why not just use Slack AI?
 
-| | Slack AI | MemGo |
+| | Slack AI | Yikes |
 |---|---|---|
 | **Storage** | Ephemeral — summaries disappear | Persistent PostgreSQL with full audit trail |
 | **Search** | Keyword only | Hybrid vector + keyword (semantic search) |
@@ -23,7 +23,7 @@ Every decision, every discussion, every "we talked about this last month" — ca
 
 ## Architecture
 
-![MemGo Architecture](./docs/architecture.png)
+![Yikes Architecture](./docs/architecture.png)
 
 **Ingestion pipeline:** Every Slack message hits the `message` event listener → stored to PostgreSQL → pushed to BullMQ (Redis) → Awareness Worker enriches it with Gemini AI (classification, entity extraction, importance scoring) → thread dirty flag set.
 
@@ -57,8 +57,8 @@ Every decision, every discussion, every "we talked about this last month" — ca
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-username/memgo.git
-cd memgo
+git clone https://github.com/your-username/Yikes.git
+cd Yikes
 npm install
 ```
 
@@ -192,7 +192,7 @@ on user_channel_memberships (workspace_id, user_id);
 
 **Step 1 — Create your app**
 
-Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch** → name it `MemGo` → select your workspace.
+Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch** → name it `Yikes` → select your workspace.
 
 **Step 2 — OAuth scopes**
 
@@ -230,7 +230,7 @@ Under **Subscribe to bot events** add:
 |---|---|
 | `message.channels` | Ingest public channel messages |
 | `message.groups` | Ingest private channel messages |
-| `app_mention` | Handle `@MemGo` mentions |
+| `app_mention` | Handle `@Yikes` mentions |
 
 > For local dev: start ngrok first (`ngrok http 4390`), use the generated `https://xxxx.ngrok.io` URL here. Slack will verify the URL — your server must be running.
 
