@@ -4,6 +4,7 @@ import { summarizeChannel } from "../../services/summary.service.js";
 import { logInteraction } from "../../services/context.service.js";
 import { searchMemory } from "../../services/search.service.js";
 import { saveThread, saveChannel } from "../../services/save.service.js";
+import { truncateForSlack } from "../../utils/text.utils.js";
 
 export function registerMemoryCommand(app) {
   app.command("/memory", async ({ command, ack, respond, client }) => {
